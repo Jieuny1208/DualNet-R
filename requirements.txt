@@ -1,0 +1,17 @@
+# PyTorch 및 필수수
+torch>=1.12.0
+torchvision>=0.13.0
+numpy>=1.20
+Pillow>=8.0
+scikit-image>=0.19
+
+# 학습 및 시각화 도구
+matplotlib>=3.3
+
+# tqdm (진행률 바 표시 - 선택사항)
+tqdm>=4.64
+
+# (Stable Diffusion 사용할 경우 필요한 추가 라이브러리)
+diffusers>=0.17.0
+transformers>=4.21.0
+accelerate>=0.16.0
