@@ -3,17 +3,17 @@ import os
 import torch
 import numpy as np
 
-# »ç¿ë °¡´É µð¹ÙÀÌ½º È®ÀÎ (CUDA ¿ì¼±)
+# ì‚¬ìš© ê°€ëŠ¥ ë””ë°”ì´ìŠ¤ í™•ì¸ (CUDA ìš°ì„ )
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# µð·ºÅä¸® »ý¼º À¯Æ¿¸®Æ¼ (Á¸ÀçÇÏÁö ¾ÊÀ¸¸é »ý¼º)
+# ë””ë ‰í† ë¦¬ ìƒì„± ìœ í‹¸ë¦¬í‹° (ì¡´ìž¬í•˜ì§€ ì•Šìœ¼ë©´ ìƒì„±)
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
-# ÅÙ¼­ denormalize ([-1,1] -> [0,255] ÀÌ¹ÌÁö ¹è¿­)
+# í…ì„œ denormalize ([-1,1] -> [0,255] ì´ë¯¸ì§€ ë°°ì—´)
 def denormalize(tensor):
-    # ÀÔ·Â: 3Ã¤³Î ÅÙ¼­ (C,H,W), Ãâ·Â: 0~255 uint8 numpy ¹è¿­ (H,W,C)
+    # ìž…ë ¥: 3ì±„ë„ í…ì„œ (C,H,W), ì¶œë ¥: 0~255 uint8 numpy ë°°ì—´ (H,W,C)
     t = tensor.clone().detach().cpu() * 0.5 + 0.5  # [-1,1] -> [0,1]
     t = t.clamp(0, 1)
     arr = (t.numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
