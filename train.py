@@ -1,281 +1,489 @@
 # train.py
-import os
-import torch
-import numpy as np
-from torch import optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
+"""DualNet-R 4ë‹¨ê³„ í•™ìŠµ íŒŒì´í”„ë¼ì¸.
 
-from diffusers import StableDiffusionInpaintPipeline
-from models.unet import UNet
+  1) ì•½ì§€ë„ ì„¸ê·¸ë©˜í…Œì´ì…˜ í•™ìŠµ (Attention U-Net, BCEWithLogits)
+  2) Self-training refinement (K ë¼ìš´ë“œ, pseudo-label ì¬í•™ìŠµ)
+  3) Stable Diffusion inpainting teacher ë¡œ pseudo-GT ìƒì„±
+  4) Student(ë³µì›) ë„¤íŠ¸ì›Œí¬ ì¦ë¥˜ í•™ìŠµ (ë§ˆìŠ¤í¬ ê°€ì¤‘ L1)
+
+ëª¨ë“  í•˜ì´í¼íŒŒë¼ë¯¸í„°ëŠ” config.yaml ì—ì„œ ì˜¨ë‹¤.
+"""
+
+import json
+import math
+import os
+
+import torch
+from PIL import Image, ImageDraw
+from torch import optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+
 from models.loss import LossFunctions
 from models.self_training import SelfTraining
-from utils.helpers import get_device, ensure_dir
+from models.teacher import generate_pseudo_gt, resolve_checkpoint
+from models.unet import build_unet
+from utils.helpers import (
+    count_parameters,
+    ensure_dir,
+    image_transform,
+    index_by_stem,
+    list_images,
+    resolve_device,
+)
+from utils.seed import seed_worker, set_global_seed
 
-# ¼¼±×¸àÅ×ÀÌ¼Ç¿ë µ¥ÀÌÅÍ¼Â Å¬·¡½º Á¤ÀÇ (¾àÁöµµ ÇĞ½À¿ë)
+
+# ---------------------------------------------------------------------------
+# ë°ì´í„°ì…‹
+# ---------------------------------------------------------------------------
 class SegDataset(Dataset):
-    def __init__(self, image_dir, mask_dir=None, bbox_file=None, transform=None):
+    """ì„¸ê·¸ë©˜í…Œì´ì…˜ìš© ë°ì´í„°ì…‹ (ì•½ì§€ë„ ë§ˆìŠ¤í¬ ë˜ëŠ” bbox ë¼ë²¨)."""
+
+    def __init__(self, image_dir, mask_dir=None, bbox_file=None, image_size=512, threshold=0.5):
         self.image_dir = image_dir
-        self.transform = transform
-        # ÀÌ¹ÌÁö ÆÄÀÏ ¸ñ·Ï °¡Á®¿À±â
-        valid_exts = [".png", ".jpg", ".jpeg", ".bmp"]
-        self.image_paths = [os.path.join(image_dir, fname) for fname in os.listdir(image_dir)
-                             if os.path.splitext(fname)[1].lower() in valid_exts]
-        self.image_paths.sort()
-        # ¸¶½ºÅ© °æ·Î ¶Ç´Â ¹Ù¿îµù¹Ú½º Á¤º¸ ¼³Á¤
-        self.mask_dir = mask_dir if mask_dir and os.path.isdir(mask_dir) else None
-        self.mask_paths = {}
-        if self.mask_dir:
-            for fname in os.listdir(self.mask_dir):
-                if os.path.splitext(fname)[1].lower() in valid_exts:
-                    self.mask_paths[fname] = os.path.join(self.mask_dir, fname)
-        # ¹Ù¿îµù¹Ú½º CSV ÆÄÀÏ ·Îµå
+        self.image_size = image_size
+        self.threshold = threshold
+        self.transform = image_transform(image_size)
+        self.image_paths = list_images(image_dir)
+        if not self.image_paths:
+            raise FileNotFoundError(f"ì´ë¯¸ì§€ë¥¼ ì°¾ì„ ìˆ˜ ì—†ìŠµë‹ˆë‹¤: {image_dir}")
+
+        # ë§ˆìŠ¤í¬ëŠ” stem ê¸°ì¤€ìœ¼ë¡œ ëŒ€ì‘ (ì›ë³¸ .jpg â†” ë§ˆìŠ¤í¬ .png)
+        self.mask_paths = index_by_stem(mask_dir) if mask_dir else {}
+
+        # ë§ˆìŠ¤í¬ê°€ ì—†ì„ ë•Œë§Œ ë°”ìš´ë”©ë°•ìŠ¤ CSV ì‚¬ìš©
         self.bbox_info = {}
         if not self.mask_paths and bbox_file and os.path.isfile(bbox_file):
-            try:
-                import pandas as pd
-                df = pd.read_csv(bbox_file)
-                for _, row in df.iterrows():
-                    fname = str(row.get("filename") or row.get("image") or "")
-                    if fname:
-                        # x,y,w,h ¶Ç´Â x1,y1,x2,y2 ÇüÅÂ Áö¿ø
-                        x = int(row.get("x") or row.get("x1", 0))
-                        y = int(row.get("y") or row.get("y1", 0))
-                        if "w" in row and "h" in row:
-                            w = int(row["w"]); h = int(row["h"])
-                        else:
-                            x2 = int(row.get("x2", 0)); y2 = int(row.get("y2", 0))
-                            w = x2 - x; h = y2 - y
-                        self.bbox_info[fname] = (x, y, w, h)
-            except Exception as e:
-                print("¹Ù¿îµù ¹Ú½º CSV ÆÄÀÏ ·Îµå ¿À·ù:", e)
-        # ·¹ÀÌºí ¾ø´Â ÀÌ¹ÌÁö´Â Á¦¿Ü (¸¶½ºÅ©/¹Ú½º Á¤º¸ ¾ø´Â °æ¿ì)
+            self.bbox_info = self._load_bboxes(bbox_file)
+
+        # ë ˆì´ë¸”ì´ í•˜ë‚˜ë¼ë„ ìˆìœ¼ë©´ ë¼ë²¨ ì—†ëŠ” ì´ë¯¸ì§€ëŠ” ì œì™¸
         if self.mask_paths or self.bbox_info:
-            self.image_paths = [p for p in self.image_paths 
-                                 if os.path.basename(p) in self.mask_paths or os.path.basename(p) in self.bbox_info]
-        # (·¹ÀÌºí Á¤º¸°¡ ÀüÇô ¾øÀ¸¸é ¸ğµç ÀÌ¹ÌÁö »ç¿ë)
+            self.image_paths = [
+                p for p in self.image_paths
+                if os.path.splitext(os.path.basename(p))[0] in self.mask_paths
+                or os.path.splitext(os.path.basename(p))[0] in self.bbox_info
+            ]
+            if not self.image_paths:
+                raise FileNotFoundError(
+                    f"ì´ë¯¸ì§€ì™€ ë¼ë²¨ì˜ íŒŒì¼ëª…ì´ ì¼ì¹˜í•˜ì§€ ì•ŠìŠµë‹ˆë‹¤: {image_dir} / {mask_dir}"
+                )
+
+    @staticmethod
+    def _load_bboxes(bbox_file):
+        """bbox CSV ë¡œë“œ. x,y,w,h ë˜ëŠ” x1,y1,x2,y2 í˜•ì‹ ì§€ì›."""
+        bbox_info = {}
+        try:
+            import pandas as pd
+        except ImportError:
+            print("[ê²½ê³ ] pandas ê°€ ì—†ì–´ bbox CSV ë¥¼ ì½ì„ ìˆ˜ ì—†ìŠµë‹ˆë‹¤.")
+            return bbox_info
+        try:
+            df = pd.read_csv(bbox_file)
+            for _, row in df.iterrows():
+                fname = str(row.get("filename") or row.get("image") or "")
+                if not fname:
+                    continue
+                x = int(row.get("x", row.get("x1", 0)))
+                y = int(row.get("y", row.get("y1", 0)))
+                if "w" in row and "h" in row:
+                    w, h = int(row["w"]), int(row["h"])
+                else:
+                    w = int(row.get("x2", 0)) - x
+                    h = int(row.get("y2", 0)) - y
+                bbox_info.setdefault(os.path.splitext(fname)[0], []).append((x, y, w, h))
+        except Exception as exc:  # CSV í˜•ì‹ ë¬¸ì œëŠ” í•™ìŠµì„ ë§‰ì§€ ì•Šê³  ê²½ê³ ë§Œ ì¶œë ¥
+            print("ë°”ìš´ë”© ë°•ìŠ¤ CSV íŒŒì¼ ë¡œë“œ ì˜¤ë¥˜:", exc)
+        return bbox_info
 
     def __len__(self):
         return len(self.image_paths)
 
+    def _load_label_mask(self, stem, size):
+        """stem ì— í•´ë‹¹í•˜ëŠ” ë¼ë²¨ì„ PIL 'L' ë§ˆìŠ¤í¬ë¡œ ë°˜í™˜ (ì—†ìœ¼ë©´ ë¹ˆ ë§ˆìŠ¤í¬)."""
+        if stem in self.mask_paths:
+            return Image.open(self.mask_paths[stem]).convert("L")
+        mask = Image.new("L", size, 0)
+        if stem in self.bbox_info:
+            draw = ImageDraw.Draw(mask)
+            for x, y, w, h in self.bbox_info[stem]:
+                draw.rectangle([x, y, x + w, y + h], fill=255)
+        return mask
+
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
+        stem = os.path.splitext(os.path.basename(img_path))[0]
         img = Image.open(img_path).convert("RGB")
-        img_tensor = self.transform(img) if self.transform else transforms.ToTensor()(img)
-        fname = os.path.basename(img_path)
-        # ¸¶½ºÅ© »ı¼º
-        mask_tensor = None
-        if fname in self.mask_paths:
-            mask_img = Image.open(self.mask_paths[fname]).convert("L")
-            mask_tensor = transforms.ToTensor()(mask_img)
-            mask_tensor = (mask_tensor > 0.5).float()  # 0 ¶Ç´Â 1·Î ÀÌÁøÈ­
-        elif fname in self.bbox_info:
-            # ¹Ù¿îµù¹Ú½º Á¤º¸¸¦ ÀÌ¿ëÇØ »ç°¢Çü ¸¶½ºÅ© »ı¼º
-            x, y, w, h = self.bbox_info[fname]
-            mask_img = Image.new("L", img.size, 0)
-            # »ç°¢ ¿µ¿ªÀ» Èò»ö(255)À¸·Î Ã¤¿ò
-            for yy in range(y, min(y+h, mask_img.height)):
-                for xx in range(x, min(x+w, mask_img.width)):
-                    mask_img.putpixel((xx, yy), 255)
-            mask_tensor = transforms.ToTensor()(mask_img)
-            mask_tensor = (mask_tensor > 0.5).float()
-        else:
-            # ·¹ÀÌºí ¾øÀ¸¸é ºó ¸¶½ºÅ© (0)
-            mask_tensor = torch.zeros((1, img_tensor.shape[1], img_tensor.shape[2]), dtype=torch.float)
+        mask = self._load_label_mask(stem, img.size)
+
+        img_tensor = self.transform(img)
+        mask = mask.resize((self.image_size, self.image_size), resample=Image.NEAREST)
+        mask_tensor = (transforms.functional.to_tensor(mask) > self.threshold).float()
         return img_tensor, mask_tensor
 
-# º¹¿ø(ÀÎÆäÀÎÆÃ)¿ë µ¥ÀÌÅÍ¼Â Å¬·¡½º Á¤ÀÇ
+
 class RestDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, target_dir, transform=None):
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.target_dir = target_dir
-        self.transform = transform
-        # ¼Õ»ó ÀÌ¹ÌÁö ¸ñ·Ï
-        valid_exts = [".png", ".jpg", ".jpeg", ".bmp"]
-        self.image_paths = [os.path.join(image_dir, fname) for fname in os.listdir(image_dir)
-                             if os.path.splitext(fname)[1].lower() in valid_exts]
-        self.image_paths.sort()
-        # ´ëÀÀµÇ´Â ¸¶½ºÅ© ¹× Å¸°Ù °æ·Î ÁØºñ
-        self.mask_paths = {}
-        self.target_paths = {}
-        if os.path.isdir(mask_dir):
-            for fname in os.listdir(mask_dir):
-                if os.path.splitext(fname)[1].lower() in valid_exts:
-                    self.mask_paths[fname] = os.path.join(mask_dir, fname)
-        if os.path.isdir(target_dir):
-            for fname in os.listdir(target_dir):
-                if os.path.splitext(fname)[1].lower() in valid_exts:
-                    self.target_paths[fname] = os.path.join(target_dir, fname)
-        # ¸¶½ºÅ©¿Í Å¸°ÙÀÌ ¸ğµÎ ÀÖ´Â ÀÌ¹ÌÁö¸¸ »ç¿ë
-        self.image_paths = [p for p in self.image_paths 
-                             if os.path.basename(p) in self.mask_paths and os.path.basename(p) in self.target_paths]
+    """ë³µì›(ì¦ë¥˜)ìš© ë°ì´í„°ì…‹: (RGB âŠ• mask) â†’ pseudo-GT."""
+
+    def __init__(self, image_dir, mask_dir, target_dir, image_size=512, threshold=0.5):
+        self.image_size = image_size
+        self.threshold = threshold
+        self.transform = image_transform(image_size)
+
+        self.mask_paths = index_by_stem(mask_dir)
+        self.target_paths = index_by_stem(target_dir)
+        # ë§ˆìŠ¤í¬ì™€ pseudo-GT ê°€ ëª¨ë‘ ìˆëŠ” ì´ë¯¸ì§€ë§Œ ì‚¬ìš©
+        self.image_paths = [
+            p for p in list_images(image_dir)
+            if os.path.splitext(os.path.basename(p))[0] in self.mask_paths
+            and os.path.splitext(os.path.basename(p))[0] in self.target_paths
+        ]
+        if not self.image_paths:
+            raise FileNotFoundError(
+                "ë³µì› í•™ìŠµìš© (ì´ë¯¸ì§€, ë§ˆìŠ¤í¬, pseudo-GT) ìŒì„ ì°¾ì§€ ëª»í–ˆìŠµë‹ˆë‹¤.\n"
+                f"  image_dir : {image_dir}\n  mask_dir  : {mask_dir}\n  target_dir: {target_dir}"
+            )
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        base = os.path.basename(img_path)
-        mask_path = self.mask_paths[base]
-        target_path = self.target_paths[base]
-        # ÀÌ¹ÌÁö, ¸¶½ºÅ©, Å¸°Ù ·Îµå
-        img = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
-        target = Image.open(target_path).convert("RGB")
-        if self.transform:
-            img_tensor = self.transform(img)
-            target_tensor = self.transform(target)
-        else:
-            img_tensor = transforms.ToTensor()(img)
-            target_tensor = transforms.ToTensor()(target)
-            img_tensor = transforms.Normalize((0.5,)*3, (0.5,)*3)(img_tensor)
-            target_tensor = transforms.Normalize((0.5,)*3, (0.5,)*3)(target_tensor)
-        # ¸¶½ºÅ© ÅÙ¼­ (0 ¶Ç´Â 1)
-        mask_tensor = transforms.ToTensor()(mask)
-        mask_tensor = (mask_tensor > 0.5).float()
-        # ÀÌ¹ÌÁö¿Í ¸¶½ºÅ© Ã¤³Î °áÇÕ
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+
+        img_tensor = self.transform(Image.open(img_path).convert("RGB"))
+        target_tensor = self.transform(Image.open(self.target_paths[stem]).convert("RGB"))
+
+        mask = Image.open(self.mask_paths[stem]).convert("L")
+        mask = mask.resize((self.image_size, self.image_size), resample=Image.NEAREST)
+        mask_tensor = (transforms.functional.to_tensor(mask) > self.threshold).float()
+
+        # x âŠ• M (ì±„ë„ ê²°í•©, 4ì±„ë„ ì…ë ¥)
         input_tensor = torch.cat([img_tensor, mask_tensor], dim=0)
-        return input_tensor, target_tensor
-
-def train(args):
-    device = get_device()
-    print(f"»ç¿ë ÀåÄ¡: {device}")
-
-    dataset_dir = args.dataset_dir
-    if not os.path.isdir(dataset_dir):
-        raise FileNotFoundError(f"µ¥ÀÌÅÍ¼Â µğ·ºÅä¸® {dataset_dir} °¡ Á¸ÀçÇÏÁö ¾Ê½À´Ï´Ù.")
-    train_img_dir = os.path.join(dataset_dir, "CarDD-TR-Image")
-    train_mask_dir = os.path.join(dataset_dir, "CarDD-TR-Mask")
-    train_edge_dir = os.path.join(dataset_dir, "CarDD-TR-Edge")
+        return input_tensor, target_tensor, mask_tensor
 
 
-    if not os.path.isdir(train_mask_dir):
-        train_mask_dir = None
-    bbox_file = os.path.join(dataset_dir, "bboxes.csv")
-    if not os.path.isfile(bbox_file):
-        bbox_file = None
-
-    # Ãâ·Â µğ·ºÅä¸® ¼³Á¤
-    ensure_dir("checkpoints")
-    pred_mask_dir_stage1 = os.path.join(dataset_dir, "pred_masks_stage1")
-    pred_mask_dir_final = os.path.join(dataset_dir, "pred_masks")
-    pseudo_gt_dir = os.path.join(dataset_dir, "pseudo_gt")
-    ensure_dir(pred_mask_dir_stage1)
-    ensure_dir(pred_mask_dir_final)
-    ensure_dir(pseudo_gt_dir)
-
-    # º¯È¯ ¼³Á¤
-    img_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-    # µ¥ÀÌÅÍ¼Â ¹× µ¥ÀÌÅÍ·Î´õ ÁØºñ
-    seg_dataset = SegDataset(train_img_dir, mask_dir=train_mask_dir, bbox_file=bbox_file, transform=img_transform)
-    seg_loader = DataLoader(seg_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
-    # ¸ğµ¨ ÃÊ±âÈ­
-    model_seg = UNet(in_channels=3, out_channels=1).to(device)
-    loss_funcs = LossFunctions()
-    seg_optimizer = optim.Adam(model_seg.parameters(), lr=args.lr)
-    epochs_seg1 = args.epochs_seg
-    epochs_seg2 = args.epochs_seg2
-
-    # 1) ¼¼±×¸àÅ×ÀÌ¼Ç ¸ğµ¨ 1Â÷ ÇĞ½À
-    print("¼¼±×¸àÅ×ÀÌ¼Ç ³×Æ®¿öÅ© 1Â÷ ÇĞ½ÀÀ» ½ÃÀÛÇÕ´Ï´Ù...")
-    model_seg.train()
-    for epoch in range(epochs_seg1):
-        total_loss = 0.0
-        for imgs, masks in seg_loader:
-            imgs = imgs.to(device)
-            masks = masks.to(device)
-            seg_optimizer.zero_grad()
-            preds = model_seg(imgs)
-            loss = loss_funcs.segmentation_loss(preds, masks)
-            loss.backward()
-            seg_optimizer.step()
-            total_loss += loss.item() * imgs.size(0)
-        avg_loss = total_loss / len(seg_loader.dataset)
-        print(f"[Epoch {epoch+1}/{epochs_seg1}] ¼¼±×¸àÅ×ÀÌ¼Ç ¼Õ½Ç: {avg_loss:.4f}")
-    print("¼¼±×¸àÅ×ÀÌ¼Ç 1Â÷ ÇĞ½À ¿Ï·á!")
-    # ¼¼±×¸àÅ×ÀÌ¼Ç ¸ğµ¨ °¡ÁßÄ¡ ÀúÀå
-    torch.save(model_seg.state_dict(), os.path.join("checkpoints", "segmentation.pth"))
-
-    # 2) Self-Training: ¿¹Ãø ¸¶½ºÅ© »ı¼º ¹× ¼¼±×¸àÅ×ÀÌ¼Ç 2Â÷ ÇĞ½À
-    if epochs_seg2 > 0:
-        print("¿¹Ãø ¸¶½ºÅ©¸¦ »ı¼ºÇÏ¿© ¼¼±×¸àÅ×ÀÌ¼Ç Self-Training(2Â÷ ÇĞ½À)À» ÁøÇàÇÕ´Ï´Ù...")
-        st = SelfTraining(model_seg, device, threshold=0.5)
-        st.generate_masks(seg_dataset.image_paths, pred_mask_dir_stage1)
-        seg_dataset_stage2 = SegDataset(train_img_dir, mask_dir=pred_mask_dir_stage1, transform=img_transform)
-        seg_loader_stage2 = DataLoader(seg_dataset_stage2, batch_size=args.batch_size, shuffle=True, drop_last=False)
-        model_seg.train()
-        for epoch in range(epochs_seg2):
-            total_loss = 0.0
-            for imgs, masks in seg_loader_stage2:
-                imgs = imgs.to(device)
-                masks = masks.to(device)
-                seg_optimizer.zero_grad()
-                preds = model_seg(imgs)
-                loss = loss_funcs.segmentation_loss(preds, masks)
-                loss.backward()
-                seg_optimizer.step()
-                total_loss += loss.item() * imgs.size(0)
-            avg_loss = total_loss / len(seg_loader_stage2.dataset)
-            print(f"[Epoch {epoch+1}/{epochs_seg2}] ¼¼±×¸àÅ×ÀÌ¼Ç Self-Training ¼Õ½Ç: {avg_loss:.4f}")
-        print("¼¼±×¸àÅ×ÀÌ¼Ç Self-Training(2Â÷) ¿Ï·á!")
-        torch.save(model_seg.state_dict(), os.path.join("checkpoints", "segmentation_ft.pth"))
-
-    # 3) ÃÖÁ¾ ¼¼±×¸àÅ×ÀÌ¼Ç ¸ğµ¨·Î ¸ğµç ÈÆ·Ã ÀÌ¹ÌÁö¿¡ ´ëÇÑ ¼Õ»ó ºÎÀ§ ¸¶½ºÅ© ¿¹Ãø
-    print("ÃÖÁ¾ ¼¼±×¸àÅ×ÀÌ¼Ç ¸ğµ¨·Î ¸¶½ºÅ©¸¦ ¿¹ÃøÇÕ´Ï´Ù...")
-    st_final = SelfTraining(model_seg, device, threshold=0.5)
-    st_final.generate_masks(seg_dataset.image_paths, pred_mask_dir_final)
-    print("¸¶½ºÅ© »ı¼º ¿Ï·á.")
-    # ¼¼±×¸àÅ×ÀÌ¼Ç ¸ğµ¨ GPU ¸Ş¸ğ¸® ÇØÁ¦
-    model_seg.to("cpu")
-    del model_seg
-    torch.cuda.empty_cache()
-
-    # 4) Stable Diffusion ÀÎÆäÀÎÆÃÀ¸·Î º¹¿ø ÀÌ¹ÌÁö »ı¼º
-    print("Stable Diffusion ÀÎÆäÀÎÆÃÀ¸·Î º¹¿ø ÀÌ¹ÌÁö »ı¼º Áß...")
-    pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        "runwayml/stable-diffusion-inpainting",
-        torch_dtype=torch.float16 if device.type == 'cuda' else torch.float32
+# ---------------------------------------------------------------------------
+# í•™ìŠµ í—¬í¼
+# ---------------------------------------------------------------------------
+def make_loader(cfg, dataset, shuffle=None):
+    return DataLoader(
+        dataset,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=cfg["data"]["shuffle"] if shuffle is None else shuffle,
+        num_workers=cfg["data"]["num_workers"],
+        drop_last=cfg["data"]["drop_last"],
+        worker_init_fn=seed_worker if cfg["data"]["num_workers"] > 0 else None,
     )
-    pipe = pipe.to(device)
-    if pipe.safety_checker is not None:
-        pipe.safety_checker = lambda images, **kwargs: (images, False)
-    for img_path in seg_dataset.image_paths:
-        img = Image.open(img_path).convert("RGB")
-        base_name = os.path.basename(img_path)
-        mask_path = os.path.join(pred_mask_dir_final, base_name)
-        mask_img = Image.open(mask_path).convert("L")
-        result = pipe(prompt="a car", image=img, mask_image=mask_img)
-        inpainted_image = result.images[0]
-        inpainted_image.save(os.path.join(pseudo_gt_dir, base_name))
-    del pipe
-    torch.cuda.empty_cache()
-    print("º¹¿ø ÀÌ¹ÌÁö »ı¼º ¿Ï·á.")
 
-    # 5) º¹¿ø ³×Æ®¿öÅ© ÇĞ½À
-    print("º¹¿ø ³×Æ®¿öÅ© ÇĞ½ÀÀ» ½ÃÀÛÇÕ´Ï´Ù...")
-    rest_dataset = RestDataset(train_img_dir, mask_dir=pred_mask_dir_final, target_dir=pseudo_gt_dir, transform=img_transform)
-    rest_loader = DataLoader(rest_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
-    model_rest = UNet(in_channels=4, out_channels=3).to(device)
-    rest_optimizer = optim.Adam(model_rest.parameters(), lr=args.lr)
-    for epoch in range(args.epochs_rest):
-        total_loss = 0.0
-        model_rest.train()
-        for inputs, targets in rest_loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            rest_optimizer.zero_grad()
-            outputs = model_rest(inputs)
-            loss = loss_funcs.restoration_loss(outputs, targets)
+
+def make_optimizer(cfg, model):
+    """Adam(lr=1e-4) + StepLR(gamma=0.5) â€” ë…¼ë¬¸ ìŠ¤í™."""
+    tcfg = cfg["train"]
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=float(tcfg["lr"]),
+        betas=tuple(tcfg["betas"]),
+        weight_decay=float(tcfg["weight_decay"]),
+    )
+    scheduler = None
+    scfg = tcfg["scheduler"]
+    if scfg["enabled"]:
+        if str(scfg["type"]).lower() != "step":
+            raise ValueError(f"ì§€ì›í•˜ì§€ ì•ŠëŠ” ìŠ¤ì¼€ì¤„ëŸ¬ íƒ€ì…: {scfg['type']}")
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer, step_size=int(scfg["step_size"]), gamma=float(scfg["gamma"])
+        )
+    return optimizer, scheduler
+
+
+def run_epochs(model, loader, optimizer, scheduler, step_fn, epochs, tag,
+               patience=0, min_delta=0.0, log_interval=50):
+    """ê³µí†µ í•™ìŠµ ë£¨í”„ (early stopping + StepLR). epoch ë³„ í‰ê·  ì†ì‹¤ ë¦¬ìŠ¤íŠ¸ë¥¼ ë°˜í™˜."""
+    history = []
+    best_loss = math.inf
+    bad_epochs = 0
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        total_loss, total_items = 0.0, 0
+        lr_used = optimizer.param_groups[0]["lr"]
+        for step, batch in enumerate(loader, start=1):
+            optimizer.zero_grad(set_to_none=True)
+            loss, batch_size = step_fn(batch)
             loss.backward()
-            rest_optimizer.step()
-            total_loss += loss.item() * inputs.size(0)
-        avg_loss = total_loss / len(rest_loader.dataset)
-        print(f"[Epoch {epoch+1}/{args.epochs_rest}] º¹¿ø ³×Æ®¿öÅ© ¼Õ½Ç: {avg_loss:.4f}")
-    print("º¹¿ø ³×Æ®¿öÅ© ÇĞ½À ¿Ï·á!")
-    torch.save(model_rest.state_dict(), os.path.join("checkpoints", "restoration.pth"))
-    print("¸ğµ¨ °¡ÁßÄ¡°¡ 'checkpoints' µğ·ºÅä¸®¿¡ ÀúÀåµÇ¾ú½À´Ï´Ù.")
+            optimizer.step()
+            total_loss += loss.item() * batch_size
+            total_items += batch_size
+            if log_interval and step % log_interval == 0:
+                print(f"  [{tag}] epoch {epoch} step {step}: loss={loss.item():.4f}")
+        if scheduler is not None:
+            scheduler.step()
+        avg_loss = total_loss / max(total_items, 1)
+        history.append(avg_loss)
+        print(f"[{tag}] Epoch {epoch}/{epochs} í‰ê·  ì†ì‹¤: {avg_loss:.4f} (lr={lr_used:.2e})")
+
+        if avg_loss < best_loss - min_delta:
+            best_loss = avg_loss
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if patience and bad_epochs >= patience:
+                print(f"[{tag}] {patience} epoch ë™ì•ˆ ê°œì„ ì´ ì—†ì–´ ì¡°ê¸° ì¢…ë£Œí•©ë‹ˆë‹¤ (epoch {epoch}).")
+                break
+    return history
+
+
+@torch.no_grad()
+def evaluate_iou(model, image_dir, mask_dir, device, image_size=512, threshold=0.5):
+    """ê²€ì¦ì…‹ í‰ê·  IoU (self-training ë¼ìš´ë“œ ì¡°ê¸° ì¢…ë£Œ íŒì •ìš©)."""
+    transform = image_transform(image_size)
+    mask_index = index_by_stem(mask_dir)
+    was_training = model.training
+    model.eval()
+    scores = []
+    for img_path in list_images(image_dir):
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        if stem not in mask_index:
+            continue
+        img = Image.open(img_path).convert("RGB")
+        pred = torch.sigmoid(model(transform(img).unsqueeze(0).to(device)))
+        pred_bin = (pred >= threshold).squeeze(0).squeeze(0).cpu()
+
+        gt = Image.open(mask_index[stem]).convert("L").resize(
+            (image_size, image_size), resample=Image.NEAREST)
+        gt_bin = (transforms.functional.to_tensor(gt) > 0.5).squeeze(0)
+
+        inter = torch.logical_and(pred_bin, gt_bin).sum().item()
+        union = torch.logical_or(pred_bin, gt_bin).sum().item()
+        scores.append(1.0 if union == 0 else inter / union)
+    model.train(was_training)
+    return sum(scores) / len(scores) if scores else float("nan")
+
+
+# ---------------------------------------------------------------------------
+# íŒŒì´í”„ë¼ì¸ ë‹¨ê³„
+# ---------------------------------------------------------------------------
+def train_segmentation(cfg, device, paths):
+    """1ë‹¨ê³„(ì•½ì§€ë„ í•™ìŠµ) + 2ë‹¨ê³„(self-training K ë¼ìš´ë“œ)."""
+    scfg = cfg["train"]["segmentation"]
+    stcfg = cfg["self_training"]
+    image_size = cfg["data"]["image_size"]
+
+    dataset = SegDataset(
+        paths["train_image_dir"],
+        mask_dir=paths["train_mask_dir"],
+        bbox_file=paths["bbox_file"],
+        image_size=image_size,
+    )
+    print(f"ì„¸ê·¸ë©˜í…Œì´ì…˜ í•™ìŠµ ì´ë¯¸ì§€ ìˆ˜: {len(dataset)}")
+    loader = make_loader(cfg, dataset)
+
+    model = build_unet(cfg, "segmentation", device)
+    print(f"ì„¸ê·¸ë©˜í…Œì´ì…˜ ë„¤íŠ¸ì›Œí¬ íŒŒë¼ë¯¸í„° ìˆ˜: {count_parameters(model):,}")
+    loss_funcs = LossFunctions.from_config(cfg)
+    optimizer, scheduler = make_optimizer(cfg, model)
+
+    def seg_step(batch):
+        imgs, masks = batch
+        imgs, masks = imgs.to(device), masks.to(device)
+        preds = model(imgs)
+        return loss_funcs.segmentation_loss(preds, masks), imgs.size(0)
+
+    print("\n[1ë‹¨ê³„] ì•½ì§€ë„ ì„¸ê·¸ë©˜í…Œì´ì…˜ í•™ìŠµì„ ì‹œì‘í•©ë‹ˆë‹¤...")
+    history = {"stage1": run_epochs(
+        model, loader, optimizer, scheduler, seg_step,
+        epochs=scfg["epochs"], tag="seg-stage1",
+        patience=scfg["early_stopping_patience"], min_delta=float(scfg["min_delta"]),
+        log_interval=cfg["train"]["log_interval"],
+    )}
+    seg_path = os.path.join(paths["checkpoint_dir"], "segmentation.pth")
+    torch.save(model.state_dict(), seg_path)
+    print(f"[1ë‹¨ê³„] ì™„ë£Œ â†’ {seg_path}")
+
+    # ---- 2ë‹¨ê³„: self-training K ë¼ìš´ë“œ ----
+    rounds_run = 0
+    iou_log = []
+    if stcfg["enabled"] and int(stcfg["rounds"]) > 0:
+        prev_iou = None
+        use_val = bool(stcfg["validate"]) and bool(stcfg["val_image_dir"])
+        if use_val:
+            prev_iou = evaluate_iou(model, stcfg["val_image_dir"], stcfg["val_mask_dir"],
+                                    device, image_size, stcfg["threshold"])
+            iou_log.append({"round": 0, "val_iou": prev_iou})
+            print(f"[2ë‹¨ê³„] ë¼ìš´ë“œ 0 (ì•½ì§€ë„) ê²€ì¦ IoU: {prev_iou:.4f}")
+
+        for k in range(1, int(stcfg["rounds"]) + 1):
+            print(f"\n[2ë‹¨ê³„] Self-training ë¼ìš´ë“œ {k}/{stcfg['rounds']}")
+            round_mask_dir = os.path.join(paths["work_dir"], f"pred_masks_round{k}")
+            st = SelfTraining(model, device, threshold=stcfg["threshold"], image_size=image_size)
+            st.generate_masks(dataset.image_paths, round_mask_dir)
+            print(f"  pseudo-label ë§ˆìŠ¤í¬ ìƒì„± ì™„ë£Œ â†’ {round_mask_dir}")
+
+            round_dataset = SegDataset(paths["train_image_dir"], mask_dir=round_mask_dir,
+                                       image_size=image_size)
+            round_loader = make_loader(cfg, round_dataset)
+            # ë¼ìš´ë“œë§ˆë‹¤ ì˜µí‹°ë§ˆì´ì €Â·ìŠ¤ì¼€ì¤„ëŸ¬ë¥¼ ì´ˆê¸° í•™ìŠµë¥ ì—ì„œ ë‹¤ì‹œ ì‹œì‘
+            optimizer, scheduler = make_optimizer(cfg, model)
+            history[f"self_training_round{k}"] = run_epochs(
+                model, round_loader, optimizer, scheduler, seg_step,
+                epochs=stcfg["epochs_per_round"], tag=f"seg-round{k}",
+                patience=scfg["early_stopping_patience"], min_delta=float(scfg["min_delta"]),
+                log_interval=cfg["train"]["log_interval"],
+            )
+            rounds_run = k
+            torch.save(model.state_dict(),
+                       os.path.join(paths["checkpoint_dir"], f"segmentation_round{k}.pth"))
+
+            if use_val:
+                iou = evaluate_iou(model, stcfg["val_image_dir"], stcfg["val_mask_dir"],
+                                   device, image_size, stcfg["threshold"])
+                iou_log.append({"round": k, "val_iou": iou})
+                print(f"[2ë‹¨ê³„] ë¼ìš´ë“œ {k} ê²€ì¦ IoU: {iou:.4f}")
+                if prev_iou is not None and (iou - prev_iou) < float(stcfg["min_iou_gain"]):
+                    print(f"[2ë‹¨ê³„] IoU ê°œì„ í­ {iou - prev_iou:+.4f} < {stcfg['min_iou_gain']} "
+                          f"â†’ ë¼ìš´ë“œ {k} ì—ì„œ ì¢…ë£Œí•©ë‹ˆë‹¤.")
+                    prev_iou = iou
+                    break
+                prev_iou = iou
+
+        ft_path = os.path.join(paths["checkpoint_dir"], "segmentation_ft.pth")
+        torch.save(model.state_dict(), ft_path)
+        print(f"[2ë‹¨ê³„] Self-training ì™„ë£Œ ({rounds_run} ë¼ìš´ë“œ) â†’ {ft_path}")
+    else:
+        print("\n[2ë‹¨ê³„] self_training.enabled=false â†’ self-training ì„ ê±´ë„ˆëœë‹ˆë‹¤.")
+
+    return model, dataset, {"loss_history": history, "iou_log": iou_log, "rounds_run": rounds_run}
+
+
+def generate_final_masks(cfg, device, model, dataset, paths):
+    """3ë‹¨ê³„ ì…ë ¥ì´ ë  ìµœì¢… ì˜ˆì¸¡ ë§ˆìŠ¤í¬ ìƒì„±."""
+    print("\n[3ë‹¨ê³„-ì¤€ë¹„] ìµœì¢… ì„¸ê·¸ë©˜í…Œì´ì…˜ ëª¨ë¸ë¡œ ì „ì²´ í•™ìŠµ ì´ë¯¸ì§€ì˜ ë§ˆìŠ¤í¬ë¥¼ ì˜ˆì¸¡í•©ë‹ˆë‹¤...")
+    st = SelfTraining(model, device, threshold=cfg["self_training"]["threshold"],
+                      image_size=cfg["data"]["image_size"])
+    mask_index = st.generate_masks(dataset.image_paths, paths["pred_mask_dir"])
+    print(f"  ë§ˆìŠ¤í¬ {len(mask_index)}ì¥ ìƒì„± ì™„ë£Œ â†’ {paths['pred_mask_dir']}")
+    return mask_index
+
+
+def generate_targets(cfg, device, dataset, mask_index, paths):
+    """3ë‹¨ê³„: Stable Diffusion teacher ë¡œ pseudo-GT ìƒì„±."""
+    if not cfg["teacher"]["enabled"]:
+        existing = index_by_stem(paths["pseudo_gt_dir"])
+        if not existing:
+            raise FileNotFoundError(
+                "teacher.enabled=false ì¸ë° pseudo-GT ê°€ ì—†ìŠµë‹ˆë‹¤.\n"
+                f"ë³µì› í•™ìŠµ íƒ€ê²Ÿì„ {paths['pseudo_gt_dir']} ì— ë¯¸ë¦¬ ì¤€ë¹„í•˜ê±°ë‚˜ "
+                "teacher.enabled=true ë¡œ ë‘ì„¸ìš”."
+            )
+        print(f"\n[3ë‹¨ê³„] teacher.enabled=false â†’ ê¸°ì¡´ pseudo-GT {len(existing)}ì¥ì„ ì‚¬ìš©í•©ë‹ˆë‹¤.")
+        return existing
+
+    print(f"\n[3ë‹¨ê³„] Stable Diffusion inpainting ìœ¼ë¡œ pseudo-GT ìƒì„± "
+          f"({resolve_checkpoint(cfg)}, {cfg['teacher']['num_inference_steps']} steps, "
+          f"guidance {cfg['teacher']['guidance_scale']})")
+    return generate_pseudo_gt(
+        cfg, device, dataset.image_paths, mask_index, paths["pseudo_gt_dir"],
+        skip_existing=cfg["teacher"]["skip_existing"],
+    )
+
+
+def train_restoration(cfg, device, paths):
+    """4ë‹¨ê³„: student ë³µì› ë„¤íŠ¸ì›Œí¬ ì¦ë¥˜ í•™ìŠµ (ë§ˆìŠ¤í¬ ê°€ì¤‘ L1)."""
+    rcfg = cfg["train"]["restoration"]
+    dataset = RestDataset(
+        paths["train_image_dir"], paths["pred_mask_dir"], paths["pseudo_gt_dir"],
+        image_size=cfg["data"]["image_size"],
+    )
+    print(f"\n[4ë‹¨ê³„] ë³µì› ë„¤íŠ¸ì›Œí¬ í•™ìŠµ ì‹œì‘ (í•™ìŠµ ìŒ {len(dataset)}ê°œ, "
+          f"Î»={cfg['loss']['lambda_mask']})")
+    loader = make_loader(cfg, dataset)
+
+    model = build_unet(cfg, "restoration", device)
+    print(f"ë³µì› ë„¤íŠ¸ì›Œí¬ íŒŒë¼ë¯¸í„° ìˆ˜: {count_parameters(model):,}")
+    loss_funcs = LossFunctions.from_config(cfg)
+    optimizer, scheduler = make_optimizer(cfg, model)
+
+    def rest_step(batch):
+        inputs, targets, masks = batch
+        inputs, targets, masks = inputs.to(device), targets.to(device), masks.to(device)
+        outputs = model(inputs)
+        return loss_funcs.restoration_loss(outputs, targets, masks), inputs.size(0)
+
+    history = run_epochs(
+        model, loader, optimizer, scheduler, rest_step,
+        epochs=rcfg["epochs"], tag="restoration",
+        patience=rcfg["early_stopping_patience"], min_delta=float(rcfg["min_delta"]),
+        log_interval=cfg["train"]["log_interval"],
+    )
+    rest_path = os.path.join(paths["checkpoint_dir"], "restoration.pth")
+    torch.save(model.state_dict(), rest_path)
+    print(f"[4ë‹¨ê³„] ì™„ë£Œ â†’ {rest_path}")
+    return model, {"loss_history": history}
+
+
+# ---------------------------------------------------------------------------
+# ì—”íŠ¸ë¦¬í¬ì¸íŠ¸
+# ---------------------------------------------------------------------------
+def resolve_paths(cfg):
+    p = cfg["paths"]
+    dataset_dir = p["dataset_dir"]
+    if not os.path.isdir(dataset_dir):
+        raise FileNotFoundError(f"ë°ì´í„°ì…‹ ë””ë ‰í† ë¦¬ê°€ ì¡´ì¬í•˜ì§€ ì•ŠìŠµë‹ˆë‹¤: {dataset_dir}")
+
+    train_image_dir = os.path.join(dataset_dir, p["train_image_subdir"])
+    train_mask_dir = os.path.join(dataset_dir, p["train_mask_subdir"])
+    bbox_file = os.path.join(dataset_dir, p["bbox_file"]) if p["bbox_file"] else None
+
+    paths = {
+        "dataset_dir": dataset_dir,
+        "train_image_dir": train_image_dir,
+        "train_mask_dir": train_mask_dir if os.path.isdir(train_mask_dir) else None,
+        "bbox_file": bbox_file if bbox_file and os.path.isfile(bbox_file) else None,
+        "checkpoint_dir": ensure_dir(p["checkpoint_dir"]),
+        "work_dir": ensure_dir(p["work_dir"]),
+        "output_dir": ensure_dir(p["output_dir"]),
+    }
+    paths["pred_mask_dir"] = ensure_dir(os.path.join(paths["work_dir"], "pred_masks"))
+    paths["pseudo_gt_dir"] = ensure_dir(os.path.join(paths["work_dir"], "pseudo_gt"))
+    return paths
+
+
+def train(cfg):
+    """ì „ì²´ íŒŒì´í”„ë¼ì¸ ì‹¤í–‰."""
+    set_global_seed(cfg["seed"], deterministic=cfg["deterministic"])
+    device = resolve_device(cfg["device"])
+    print(f"ì‚¬ìš© ì¥ì¹˜: {device} / ì‹œë“œ: {cfg['seed']}")
+
+    paths = resolve_paths(cfg)
+    if paths["train_mask_dir"] is None and paths["bbox_file"] is None:
+        print("[ê²½ê³ ] ë§ˆìŠ¤í¬ ë””ë ‰í† ë¦¬ì™€ bbox íŒŒì¼ì´ ëª¨ë‘ ì—†ìŠµë‹ˆë‹¤. ë¼ë²¨ì´ ë¹ˆ ë§ˆìŠ¤í¬ë¡œ ì±„ì›Œì§‘ë‹ˆë‹¤.")
+
+    seg_model, seg_dataset, seg_stats = train_segmentation(cfg, device, paths)
+    mask_index = generate_final_masks(cfg, device, seg_model, seg_dataset, paths)
+
+    # teacher ë¡œë“œ ì „ì— ì„¸ê·¸ë©˜í…Œì´ì…˜ ëª¨ë¸ì˜ GPU ë©”ëª¨ë¦¬ë¥¼ í•´ì œ
+    seg_model.to("cpu")
+    del seg_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    generate_targets(cfg, device, seg_dataset, mask_index, paths)
+    _, rest_stats = train_restoration(cfg, device, paths)
+
+    # ì‹¤í–‰ì— ì‚¬ìš©ëœ ì„¤ì •ê³¼ ìš”ì•½ì„ í•¨ê»˜ ì €ì¥ (ì¬í˜„ì„± ê¸°ë¡)
+    cfg.dump(os.path.join(paths["output_dir"], "used_config.yaml"))
+    summary = {
+        "seed": cfg["seed"],
+        "teacher": resolve_checkpoint(cfg) if cfg["teacher"]["enabled"] else None,
+        "lambda_mask": cfg["loss"]["lambda_mask"],
+        "use_attention": cfg["model"]["use_attention"],
+        "self_training_rounds_run": seg_stats["rounds_run"],
+        "val_iou_log": seg_stats["iou_log"],
+        "segmentation_loss_history": seg_stats["loss_history"],
+        "restoration_loss_history": rest_stats["loss_history"],
+    }
+    summary_path = os.path.join(paths["output_dir"], "train_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"\ní•™ìŠµ ì™„ë£Œ. ìš”ì•½: {summary_path}, ê°€ì¤‘ì¹˜: {paths['checkpoint_dir']}/")
+    return summary

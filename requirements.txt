@@ -1,17 +1,23 @@
-# PyTorch ¹× ÇÊ¼ö¼ö
+# PyTorch ë° í•„ìˆ˜ íŒ¨í‚¤ì§€
 torch>=1.12.0
 torchvision>=0.13.0
 numpy>=1.20
 Pillow>=8.0
-scikit-image>=0.19
+scikit-image>=0.22          # structural_similarity(channel_axis=...) ì‚¬ìš©
 
-# ÇÐ½À ¹× ½Ã°¢È­ µµ±¸
+# ì„¤ì • íŒŒì¼(config.yaml) ë¡œë”©
+PyYAML>=6.0
+
+# í•™ìŠµ ë° ì‹œê°í™” ë„êµ¬
 matplotlib>=3.3
 
-# tqdm (ÁøÇà·ü ¹Ù Ç¥½Ã - ¼±ÅÃ»çÇ×)
+# tqdm (ì§„í–‰ë¥  ë°” í‘œì‹œ - ì„ íƒì‚¬í•­)
 tqdm>=4.64
 
-# (Stable Diffusion »ç¿ëÇÒ °æ¿ì ÇÊ¿äÇÑ Ãß°¡ ¶óÀÌºê·¯¸®)
+# bbox CSV ì•½ì§€ë„ ë¼ë²¨ ì‚¬ìš© ì‹œ í•„ìš” (ì„ íƒì‚¬í•­)
+pandas>=1.3
+
+# Stable Diffusion teacher (pseudo-GT ìƒì„±)
 diffusers>=0.17.0
 transformers>=4.21.0
 accelerate>=0.16.0

@@ -1,0 +1,23 @@
+# 학습 산출물 (용량이 크므로 커밋하지 않음)
+checkpoints/
+work/
+outputs/
+ablation_results/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# 논문 원고 및 리비전 실험 자료 (public 저장소에 올리지 않음)
+DualNet-R_revised.tex
+CLAUDE_CODE_TASK.md
+dualnet_revision_experiments/
+dualnet_revision_experiments.zip
+
+# 데이터셋 (저자 배포본 — 저장소에 포함하지 않음)
+CarDD_release/

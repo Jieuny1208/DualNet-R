@@ -1,175 +1,222 @@
 # evaluate.py
+"""í…ŒìŠ¤íŠ¸ì…‹ í‰ê°€: ì„¸ê·¸ë©˜í…Œì´ì…˜ IoU + ë³µì› PSNR/SSIM + ìˆ˜ë¦¬ ê°€ëŠ¥ì„± ë“±ê¸‰.
+
+ê¸°ëŒ€í•˜ëŠ” test_dir êµ¬ì¡° (original/masks ëŠ” ì„ íƒ):
+    test_dir/
+      images/    ì†ìƒ ì´ë¯¸ì§€ (ì—†ìœ¼ë©´ test_dir ìì²´ë¥¼ ì´ë¯¸ì§€ í´ë”ë¡œ ì‚¬ìš©)
+      original/  ì •ìƒ ìƒíƒœ ì›ë³¸ (PSNR/SSIM ê³„ì‚°ìš©)
+      masks/     ì •ë‹µ ë§ˆìŠ¤í¬ (IoU ê³„ì‚°ìš©)
+"""
+
+import csv
 import os
-import torch
+
 import numpy as np
+import torch
 from PIL import Image
-from torchvision import transforms
-from diffusers import StableDiffusionInpaintPipeline
-from skimage.metrics import structural_similarity, peak_signal_noise_ratio
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-from models.unet import UNet
-from utils.helpers import get_device, denormalize
+from models.self_training import SelfTraining
+from models.unet import build_unet
+from utils.helpers import (
+    denormalize,
+    ensure_dir,
+    image_transform,
+    index_by_stem,
+    list_images,
+    resolve_device,
+)
+from utils.seed import set_global_seed
 
-def evaluate(args):
-    device = get_device()
-    print(f"»ç¿ë ÀåÄ¡: {device}")
+# ìˆ˜ë¦¬ ê°€ëŠ¥ì„± íŒì • ê¸°ì¤€ (ë…¼ë¬¸ 5.x ê·œì¹™ ê¸°ë°˜ ëª¨ë“ˆì˜ ê°„ì´ ë²„ì „)
+GRADE_THRESHOLDS = {
+    "irreparable": {"psnr": 20.0, "ssim": 0.80, "damage_ratio": 30.0},
+    "excellent": {"psnr": 30.0, "ssim": 0.90, "damage_ratio": 10.0},
+}
 
-    test_dir = args.test_dir
-    if not os.path.isdir(test_dir):
-        raise FileNotFoundError(f"Å×½ºÆ® µ¥ÀÌÅÍ µğ·ºÅä¸® {test_dir} °¡ Á¸ÀçÇÏÁö ¾Ê½À´Ï´Ù.")
-    # Å×½ºÆ® µğ·ºÅä¸® ³» Æú´õ ±¸Á¶ È®ÀÎ
-    if os.path.isdir(os.path.join(test_dir, "images")):
-        image_dir = os.path.join(test_dir, "images")
-    else:
-        image_dir = test_dir
-    orig_dir = os.path.join(test_dir, "original")
-    mask_dir = os.path.join(test_dir, "masks")
-    have_orig = os.path.isdir(orig_dir)
-    have_mask = os.path.isdir(mask_dir)
 
-    valid_exts = [".png", ".jpg", ".jpeg", ".bmp"]
-    image_paths = [os.path.join(image_dir, f) for f in os.listdir(image_dir)
-                   if os.path.splitext(f)[1].lower() in valid_exts]
-    image_paths.sort()
+def load_models(cfg, device, seg_weights=None, rest_weights=None):
+    """ì„¸ê·¸ë©˜í…Œì´ì…˜ / ë³µì› ëª¨ë¸ì„ config ìŠ¤í™ëŒ€ë¡œ ë§Œë“¤ê³  ê°€ì¤‘ì¹˜ë¥¼ ë¡œë“œ."""
+    ckpt_dir = cfg["paths"]["checkpoint_dir"]
+    seg_weights = seg_weights or os.path.join(ckpt_dir, "segmentation.pth")
+    rest_weights = rest_weights or os.path.join(ckpt_dir, "restoration.pth")
+    for path in (seg_weights, rest_weights):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"ê°€ì¤‘ì¹˜ íŒŒì¼ì„ ì°¾ì„ ìˆ˜ ì—†ìŠµë‹ˆë‹¤: {path}")
 
-    # ¸ğµ¨ ·Îµå
-    seg_model = UNet(in_channels=3, out_channels=1).to(device)
-    rest_model = UNet(in_channels=4, out_channels=3).to(device)
-    seg_weights = args.seg_model_path or os.path.join("checkpoints", "segmentation.pth")
-    rest_weights = args.rest_model_path or os.path.join("checkpoints", "restoration.pth")
+    seg_model = build_unet(cfg, "segmentation", device)
+    rest_model = build_unet(cfg, "restoration", device)
     seg_model.load_state_dict(torch.load(seg_weights, map_location=device))
     rest_model.load_state_dict(torch.load(rest_weights, map_location=device))
     seg_model.eval()
     rest_model.eval()
+    return seg_model, rest_model
 
-    # Stable Diffusion ÆÄÀÌÇÁ¶óÀÎ ·Îµå (ºñ±³¿ë)
-    pipe = None
+
+@torch.no_grad()
+def restore_image(cfg, seg_model, rest_model, img, device):
+    """ë‹¨ì¼ ì´ë¯¸ì§€ ë³µì›. (ë³µì› PIL ì´ë¯¸ì§€, ì˜ˆì¸¡ ë§ˆìŠ¤í¬ PIL ì´ë¯¸ì§€) ë°˜í™˜."""
+    image_size = cfg["data"]["image_size"]
+    threshold = cfg["eval"]["mask_threshold"]
+
+    st = SelfTraining(seg_model, device, threshold=threshold, image_size=image_size)
+    mask_pil = st.predict_mask(img)  # ì›ë³¸ í•´ìƒë„ ì´ì§„ ë§ˆìŠ¤í¬
+
+    transform = image_transform(image_size)
+    img_tensor = transform(img).unsqueeze(0).to(device)
+    mask_small = mask_pil.resize((image_size, image_size), resample=Image.NEAREST)
+    mask_tensor = torch.from_numpy(
+        (np.array(mask_small, dtype=np.float32) > 127).astype(np.float32)
+    ).unsqueeze(0).unsqueeze(0).to(device)
+
+    output_tensor = rest_model(torch.cat([img_tensor, mask_tensor], dim=1))
+    output_pil = Image.fromarray(denormalize(output_tensor[0]))
+    # ì§€í‘œ ê³„ì‚°ì€ ì›ë³¸ í•´ìƒë„ì—ì„œ ìˆ˜í–‰
+    if output_pil.size != img.size:
+        output_pil = output_pil.resize(img.size, resample=Image.BILINEAR)
+    return output_pil, mask_pil
+
+
+def compute_damage_ratio(gt_img, restored_img, mask_arr):
+    """ì˜ˆì¸¡ ë§ˆìŠ¤í¬ ì˜ì—­ ë‚´ì—ì„œ ë°ê¸° ì°¨ì´ê°€ 20 ì´ìƒì¸ í”½ì…€ ë¹„ìœ¨(%)."""
+    gt_gray = np.array(gt_img.convert("L"), dtype=np.int16)
+    rest_gray = np.array(restored_img.convert("L"), dtype=np.int16)
+    diff_map = np.abs(gt_gray - rest_gray)
+    mask_bin = mask_arr > 127
+    if mask_bin.shape != diff_map.shape:
+        return float("nan")
+    damaged = np.logical_and(diff_map > 20, mask_bin).sum()
+    total = mask_bin.sum()
+    return float(damaged) / float(total) * 100.0 if total else 0.0
+
+
+def grade_restoration(psnr_val, ssim_val, damage_ratio):
+    bad, good = GRADE_THRESHOLDS["irreparable"], GRADE_THRESHOLDS["excellent"]
+    dr = 0.0 if damage_ratio != damage_ratio else damage_ratio  # NaN ë°©ì–´
+    if psnr_val < bad["psnr"] or ssim_val < bad["ssim"] or dr > bad["damage_ratio"]:
+        return "Irreparable"
+    if psnr_val >= good["psnr"] and ssim_val >= good["ssim"] and dr <= good["damage_ratio"]:
+        return "Excellent"
+    return "Repairable"
+
+
+def evaluate(cfg, seg_weights=None, rest_weights=None):
+    set_global_seed(cfg["seed"], deterministic=cfg["deterministic"])
+    device = resolve_device(cfg["device"])
+    print(f"ì‚¬ìš© ì¥ì¹˜: {device}")
+
+    test_dir = cfg["paths"]["test_dir"]
+    if not os.path.isdir(test_dir):
+        raise FileNotFoundError(f"í…ŒìŠ¤íŠ¸ ë°ì´í„° ë””ë ‰í† ë¦¬ê°€ ì¡´ì¬í•˜ì§€ ì•ŠìŠµë‹ˆë‹¤: {test_dir}")
+    image_dir = os.path.join(test_dir, "images")
+    if not os.path.isdir(image_dir):
+        image_dir = test_dir
+    orig_index = index_by_stem(os.path.join(test_dir, "original"))
+    gt_mask_index = index_by_stem(os.path.join(test_dir, "masks"))
+
+    image_paths = list_images(image_dir)
+    if not image_paths:
+        print("í…ŒìŠ¤íŠ¸í•  ì´ë¯¸ì§€ê°€ ì—†ìŠµë‹ˆë‹¤.")
+        return {}
+    print(f"í…ŒìŠ¤íŠ¸ ì´ë¯¸ì§€ ìˆ˜: {len(image_paths)} "
+          f"(ì›ë³¸ {len(orig_index)}ì¥, ì •ë‹µ ë§ˆìŠ¤í¬ {len(gt_mask_index)}ì¥)")
+
+    seg_model, rest_model = load_models(cfg, device, seg_weights, rest_weights)
+
+    output_dir = ensure_dir(cfg["paths"]["output_dir"])
+    restored_dir = ensure_dir(os.path.join(output_dir, "restored")) if cfg["eval"]["save_outputs"] else None
+
+    # ë¹„êµìš© teacher íŒŒì´í”„ë¼ì¸ (ì„ íƒ)
+    teacher = None
+    if cfg["eval"]["compare_teacher"] and cfg["teacher"]["enabled"]:
+        from models.teacher import DiffusionTeacher
+        teacher = DiffusionTeacher(cfg, device).load()
+
+    rows = []
     try:
-        pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            "runwayml/stable-diffusion-inpainting",
-            torch_dtype=torch.float16 if device.type == 'cuda' else torch.float32
-        )
-        pipe = pipe.to(device)
-        if pipe.safety_checker is not None:
-            pipe.safety_checker = lambda images, **kwargs: (images, False)
-    except Exception as e:
-        print("Stable Diffusion ÆÄÀÌÇÁ¶óÀÎ ·Îµå Áß ¿À·ù:", e)
-        pipe = None
+        for i, img_path in enumerate(image_paths):
+            stem = os.path.splitext(os.path.basename(img_path))[0]
+            img = Image.open(img_path).convert("RGB")
+            output_pil, mask_pil = restore_image(cfg, seg_model, rest_model, img, device)
+            mask_arr = np.array(mask_pil)
 
-    total_psnr = 0.0
-    total_ssim = 0.0
-    total_psnr_sd = 0.0
-    total_ssim_sd = 0.0
-    total_iou = 0.0
-    count = 0
+            if restored_dir:
+                output_pil.save(os.path.join(restored_dir, f"{stem}.png"))
 
-    img_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,)*3, (0.5,)*3)
-    ])
-    for img_path in image_paths:
-        base_name = os.path.basename(img_path)
-        img = Image.open(img_path).convert("RGB")
-        gt_orig = None
-        gt_mask = None
-        if have_orig:
-            orig_path = os.path.join(orig_dir, base_name)
-            if os.path.isfile(orig_path):
-                gt_orig = Image.open(orig_path).convert("RGB")
-        if have_mask:
-            mask_path = os.path.join(mask_dir, base_name)
-            if os.path.isfile(mask_path):
-                gt_mask = Image.open(mask_path).convert("L")
+            row = {"image": stem, "psnr": None, "ssim": None, "damage_ratio": None,
+                   "grade": None, "iou": None, "teacher_psnr": None, "teacher_ssim": None}
 
-        # ¼¼±×¸àÅ×ÀÌ¼Ç ¿¹Ãø
-        img_tensor = img_transform(img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            pred_mask_logits = seg_model(img_tensor)
-            pred_mask_prob = torch.sigmoid(pred_mask_logits)
-        pred_mask = (pred_mask_prob >= 0.5).cpu().numpy().astype(np.uint8)
-        pred_mask = pred_mask[0, 0] * 255  # 2D array (H,W)
-        mask_pil = Image.fromarray(pred_mask, mode='L')
+            if stem in orig_index:
+                gt_img = Image.open(orig_index[stem]).convert("RGB")
+                if gt_img.size != output_pil.size:
+                    gt_img = gt_img.resize(output_pil.size, resample=Image.BILINEAR)
+                gt_arr, out_arr = np.array(gt_img), np.array(output_pil)
+                row["psnr"] = float(peak_signal_noise_ratio(gt_arr, out_arr, data_range=255))
+                row["ssim"] = float(structural_similarity(gt_arr, out_arr, channel_axis=-1,
+                                                          data_range=255))
+                row["damage_ratio"] = compute_damage_ratio(gt_img, output_pil, mask_arr)
+                row["grade"] = grade_restoration(row["psnr"], row["ssim"], row["damage_ratio"])
 
-        # ¿ì¸® ¸ğµ¨ º¹¿ø Ãß·Ğ
-        mask_tensor = torch.from_numpy((pred_mask // 255)).unsqueeze(0).unsqueeze(0).float().to(device)
-        input_tensor = torch.cat([img_tensor, mask_tensor], dim=1)
-        with torch.no_grad():
-            output_tensor = rest_model(input_tensor)
-        output_np = denormalize(output_tensor[0])
-        output_pil = Image.fromarray(output_np)
+                if teacher is not None:
+                    try:
+                        teacher_pil = teacher.restore(img, mask_pil, index=i)
+                        t_arr = np.array(teacher_pil.resize(gt_img.size, resample=Image.BILINEAR))
+                        row["teacher_psnr"] = float(
+                            peak_signal_noise_ratio(gt_arr, t_arr, data_range=255))
+                        row["teacher_ssim"] = float(
+                            structural_similarity(gt_arr, t_arr, channel_axis=-1, data_range=255))
+                    except Exception as exc:
+                        print(f"teacher ë³µì› ì‹¤íŒ¨ ({stem}):", exc)
 
-        # Stable Diffusion º¹¿ø Ãß·Ğ
-        stable_pil = None
-        if pipe is not None:
-            try:
-                result = pipe(prompt="a car", image=img, mask_image=mask_pil)
-                stable_pil = result.images[0]
-            except Exception as e:
-                print(f"Stable Diffusion º¹¿ø ½ÇÆĞ ({base_name}):", e)
+            if stem in gt_mask_index:
+                gt_mask = Image.open(gt_mask_index[stem]).convert("L")
+                if gt_mask.size != mask_pil.size:
+                    gt_mask = gt_mask.resize(mask_pil.size, resample=Image.NEAREST)
+                gt_bin = np.array(gt_mask) > 127
+                pred_bin = mask_arr > 127
+                union = np.logical_or(pred_bin, gt_bin).sum()
+                inter = np.logical_and(pred_bin, gt_bin).sum()
+                row["iou"] = 1.0 if union == 0 else float(inter) / float(union)
 
-        # ÁöÇ¥ °è»ê
-        if gt_orig is not None:
-            psnr_val = peak_signal_noise_ratio(np.array(gt_orig), np.array(output_pil), data_range=255)
-            ssim_val = structural_similarity(np.array(gt_orig), np.array(output_pil), multichannel=True)
-            total_psnr += psnr_val
-            total_ssim += ssim_val
-            
-            # º¹¿ø ¼Õ»ó·ü °è»ê (¿¹Ãø ¸¶½ºÅ© ¿µ¿ª ³» Â÷ÀÌ 20 ÀÌ»óÀÎ ÇÈ¼¿ ºñÀ²)
-            orig_np = np.array(gt_orig.convert("L"))  # ±×·¹ÀÌ½ºÄÉÀÏ
-            rest_np = np.array(output_pil.convert("L"))
-            diff_map = np.abs(orig_np - rest_np)
-            mask_bin = pred_mask > 127  # ¿¹Ãø ¸¶½ºÅ© ¹ÙÀÌ³Ê¸®
+            rows.append(row)
+            if row["psnr"] is not None:
+                print(f"{stem}: PSNR {row['psnr']:.2f}dB, SSIM {row['ssim']:.4f}, "
+                      f"Damage {row['damage_ratio']:.1f}%, Grade {row['grade']}")
+    finally:
+        if teacher is not None:
+            teacher.unload()
 
-            damaged_pixels = np.logical_and(diff_map > 20, mask_bin).sum()
-            total_mask_pixels = mask_bin.sum() or 1
-            damage_ratio = (damaged_pixels / total_mask_pixels) * 100.0
+    # per-image CSV ì €ì¥ (í†µê³„ ê²€ì • ìŠ¤í¬ë¦½íŠ¸ ì…ë ¥ìœ¼ë¡œ ì‚¬ìš©)
+    csv_path = os.path.join(output_dir, cfg["eval"]["per_image_csv"])
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\nper-image ì§€í‘œ ì €ì¥: {csv_path}")
 
-            # ¼ö¸® µî±Ş ÆÇ´Ü
-            if psnr_val < 20 or ssim_val < 0.80 or damage_ratio > 30:
-                grade = "Irreparable"
-            elif psnr_val >= 30 and ssim_val >= 0.90 and damage_ratio <= 10:
-                grade = "Excellent"
-            else:
-                grade = "Repairable"
+    def _mean(key):
+        values = [r[key] for r in rows if r[key] is not None]
+        return sum(values) / len(values) if values else None
 
-            print(f"{base_name} ? PSNR: {psnr_val:.2f}, SSIM: {ssim_val:.4f}, "
-                  f"Damage: {damage_ratio:.1f}%, Restoration Grade: {grade}")
-            
-            if stable_pil is not None:
-                psnr_sd_val = peak_signal_noise_ratio(np.array(gt_orig), np.array(stable_pil), data_range=255)
-                ssim_sd_val = structural_similarity(np.array(gt_orig), np.array(stable_pil), multichannel=True)
-            else:
-                psnr_sd_val = 0.0
-                ssim_sd_val = 0.0
-            total_psnr_sd += psnr_sd_val
-            total_ssim_sd += ssim_sd_val
-        if gt_mask is not None:
-            gt_mask_arr = np.array(gt_mask)
-            gt_mask_bin = gt_mask_arr > 127
-            pred_mask_bin = pred_mask > 127
-            union = np.logical_or(pred_mask_bin, gt_mask_bin).sum()
-            inter = np.logical_and(pred_mask_bin, gt_mask_bin).sum()
-            iou_val = 1.0 if union == 0 else inter / union
-            total_iou += iou_val
-        count += 1
-
-    if count == 0:
-        print("Å×½ºÆ®ÇÒ ÀÌ¹ÌÁö°¡ ¾ø½À´Ï´Ù.")
-        return
-    if have_mask:
-        avg_iou = total_iou / count
-        print(f"¼¼±×¸àÅ×ÀÌ¼Ç IoU: {avg_iou*100:.1f}%")
+    summary = {
+        "count": len(rows),
+        "psnr": _mean("psnr"),
+        "ssim": _mean("ssim"),
+        "iou": _mean("iou"),
+        "teacher_psnr": _mean("teacher_psnr"),
+        "teacher_ssim": _mean("teacher_ssim"),
+    }
+    print("\n===== í‰ê°€ ìš”ì•½ =====")
+    if summary["iou"] is not None:
+        print(f"ì„¸ê·¸ë©˜í…Œì´ì…˜ í‰ê·  IoU: {summary['iou'] * 100:.1f}%")
     else:
-        print("Á¤´ä ¸¶½ºÅ©°¡ ¾ø¾î ¼¼±×¸àÅ×ÀÌ¼Ç IoU¸¦ °è»êÇÒ ¼ö ¾ø½À´Ï´Ù.")
-    if have_orig:
-        avg_psnr = total_psnr / count
-        avg_ssim = total_ssim / count
-        avg_psnr_sd = total_psnr_sd / count if pipe is not None else 0.0
-        avg_ssim_sd = total_ssim_sd / count if pipe is not None else 0.0
-        print(f"¿ì¸® ¸ğµ¨ Æò±Õ PSNR: {avg_psnr:.2f} dB")
-        print(f"¿ì¸® ¸ğµ¨ Æò±Õ SSIM: {avg_ssim:.4f}")
-        if pipe is not None:
-            print(f"Stable Diffusion Æò±Õ PSNR: {avg_psnr_sd:.2f} dB")
-            print(f"Stable Diffusion Æò±Õ SSIM: {avg_ssim_sd:.4f}")
+        print("ì •ë‹µ ë§ˆìŠ¤í¬ê°€ ì—†ì–´ ì„¸ê·¸ë©˜í…Œì´ì…˜ IoU ë¥¼ ê³„ì‚°í•  ìˆ˜ ì—†ìŠµë‹ˆë‹¤.")
+    if summary["psnr"] is not None:
+        print(f"DualNet-R í‰ê·  PSNR: {summary['psnr']:.2f} dB")
+        print(f"DualNet-R í‰ê·  SSIM: {summary['ssim']:.4f}")
     else:
-        print("¿øº» ÀÌ¹ÌÁö°¡ ¾ø¾î PSNR/SSIMÀ» °è»êÇÒ ¼ö ¾ø½À´Ï´Ù.")
+        print("ì›ë³¸ ì´ë¯¸ì§€ê°€ ì—†ì–´ PSNR/SSIM ì„ ê³„ì‚°í•  ìˆ˜ ì—†ìŠµë‹ˆë‹¤.")
+    if summary["teacher_psnr"] is not None:
+        print(f"Teacher(SD) í‰ê·  PSNR: {summary['teacher_psnr']:.2f} dB")
+        print(f"Teacher(SD) í‰ê·  SSIM: {summary['teacher_ssim']:.4f}")
+    return summary

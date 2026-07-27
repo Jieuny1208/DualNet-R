@@ -1,0 +1,95 @@
+# =============================================================================
+# DualNet-R 설정 파일
+# 논문(DualNet-R, Scientific Reports revision) 스펙의 모든 하이퍼파라미터를 여기에 모았다.
+# 실험별 변경은 이 파일을 복사하거나 `--set key.path=value` 오버라이드로만 수행할 것.
+# =============================================================================
+
+# 전역 시드: 데이터 분할 / 가중치 초기화 / pseudo-GT 생성에 공통 적용
+seed: 42
+deterministic: false        # true 로 두면 cuDNN 결정론 모드 (느려짐)
+device: auto                # auto | cuda | cpu | mps
+
+paths:
+  # 학습 데이터 (CarDD-SOD 형식)
+  dataset_dir: CarDD_release/CarDD_SOD/CarDD-TR
+  train_image_subdir: CarDD-TR-Image
+  train_mask_subdir: CarDD-TR-Mask       # 약지도 라벨 (없으면 bbox_file 사용)
+  bbox_file: bboxes.csv                  # dataset_dir 기준 상대 경로 (없으면 무시)
+
+  # 평가 데이터 (test_dir/images, test_dir/original, test_dir/masks 구조)
+  test_dir: CarDD_release/CarDD_SOD/CarDD-TE
+
+  # 산출물
+  checkpoint_dir: checkpoints
+  work_dir: work                         # 예측 마스크 / pseudo-GT 중간 산출물
+  output_dir: outputs                    # 평가·추론 결과
+
+data:
+  image_size: 512             # 학습/추론 해상도 (teacher 해상도와 일치시킬 것)
+  num_workers: 0
+  shuffle: true
+  drop_last: false
+
+model:
+  features: [64, 128, 256, 512]   # + bottleneck 1024
+  use_attention: true             # false → ablation (b) w/o attention
+
+train:
+  batch_size: 8                   # 논문: GPU 메모리 제약에 따라 8
+  lr: 1.0e-4                      # 논문: Adam 초기 학습률 1e-4
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  scheduler:
+    enabled: true                 # 논문: 학습률을 0.5배로 감소시키는 스케줄
+    type: step                    # StepLR
+    step_size: 40                 # epoch 100 근방 수렴 → 30~50 권장
+    gamma: 0.5
+  segmentation:
+    epochs: 500                   # 논문: 최대 500 epoch
+    early_stopping_patience: 20   # 0 이면 early stopping 비활성화
+    min_delta: 1.0e-4
+  restoration:
+    epochs: 500
+    early_stopping_patience: 20
+    min_delta: 1.0e-4
+  log_interval: 50                # step 단위 로그 주기
+  save_every_epoch: false
+
+loss:
+  # 마스크 가중 L1 복원 손실: L = ||(1 + λM) ⊙ (S(x⊕M) − ŷ)||₁
+  lambda_mask: 1.0                # λ. 0 으로 두면 일반 L1 (ablation 비교용)
+
+self_training:
+  enabled: true                   # false → ablation w/o self-training
+  rounds: 1                       # K. 논문 재현 기본값 1 (K≥1 지원)
+  epochs_per_round: 100
+  threshold: 0.5                  # 확률맵 이진화 임계값
+  min_iou_gain: 0.005             # 라운드 간 val IoU 개선폭이 이보다 작으면 조기 종료
+  validate: false                 # 검증 IoU 기반 조기 종료 사용 여부
+  val_image_dir: ""               # validate=true 일 때 필요
+  val_mask_dir: ""
+
+teacher:
+  enabled: true                   # false → ablation w/o pseudo-GT (외부 target_dir 필요)
+  name: sd21                      # sd15 | sd21 | 전체 HuggingFace 체크포인트 ID
+  checkpoints:
+    sd15: runwayml/stable-diffusion-inpainting
+    sd21: stabilityai/stable-diffusion-2-inpainting
+  prompt: "a car"
+  negative_prompt: "blurry, distorted, unrealistic"
+  scheduler: ddim                 # DDIMScheduler 명시 지정
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  eta: 0.0                        # DDIM eta (0 = 결정론적)
+  resolution: 512
+  mask_dilation: 0                # 마스크 팽창 반경(px). 0 이면 팽창 없음
+  composite: true                 # 마스크 외부는 원본 픽셀 유지
+  fp16: true                      # GPU 에서만 적용
+  disable_safety_checker: true
+  skip_existing: true             # 이미 생성된 pseudo-GT 는 재생성하지 않음
+
+eval:
+  mask_threshold: 0.5
+  save_outputs: true              # 복원 결과 이미지 저장
+  per_image_csv: per_image_metrics.csv   # output_dir 기준 상대 경로
+  compare_teacher: false          # true 면 SD teacher 출력과도 비교 (느림)

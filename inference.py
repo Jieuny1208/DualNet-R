@@ -1,173 +1,91 @@
+# inference.py
+"""ë‹¨ì¼ ì´ë¯¸ì§€ / ë””ë ‰í† ë¦¬ ì¶”ë¡ .
+
+íŒŒì´í”„ë¼ì¸ì€ í•™ìŠµê³¼ ë™ì¼í•˜ë‹¤: ì„¸ê·¸ë©˜í…Œì´ì…˜ìœ¼ë¡œ ì†ìƒ ë§ˆìŠ¤í¬ë¥¼ ì˜ˆì¸¡í•œ ë’¤
+(RGB âŠ• mask) 4ì±„ë„ì„ ë³µì› ë„¤íŠ¸ì›Œí¬ì— ë„£ì–´ ë³µì› ì´ë¯¸ì§€ë¥¼ ì–»ëŠ”ë‹¤.
+ì •ìƒ ì›ë³¸(--gt)ì´ ì£¼ì–´ì§€ë©´ PSNR/SSIM ê³¼ ìˆ˜ë¦¬ ê°€ëŠ¥ ì—¬ë¶€ë„ í•¨ê»˜ ì¶œë ¥í•œë‹¤.
+"""
+
 import os
-import argparse
+
 import numpy as np
-import torch
 from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-from torchvision import transforms
 
-from models_unet import UNet  # ÇÊ¿ä¿¡ µû¶ó »ç¿ëµÇ´Â ¸ğµ¨ Å¬·¡½º (¿¹: U-Net)
+from evaluate import grade_restoration, load_models, restore_image
+from utils.helpers import ensure_dir, list_images, resolve_device
+from utils.seed import set_global_seed
 
-# PSNR ¹× SSIM ±âÁØ°ª (ÇÊ¿ä½Ã º¯°æ °¡´É)
+# ìˆ˜ë¦¬ ê°€ëŠ¥ íŒì • ê¸°ì¤€
 PSNR_THRESHOLD = 20.0
 SSIM_THRESHOLD = 0.80
 
-def load_model(checkpoint_path, device):
-    """¸ğµ¨À» »ı¼ºÇÏ°í Ã¼Å©Æ÷ÀÎÆ®¸¦ ºÒ·¯¿À´Â ÇÔ¼ö."""
-    # ¸ğµ¨ ÀÎ½ºÅÏ½º »ı¼º (ÀÔ·Â Ã¤³Î 3, Ãâ·Â Ã¤³Î 3ÀÎ U-Net ¿¹½Ã)
-    model = UNet() if hasattr(UNet, "__call__") else UNet
-    try:
-        model = UNet(in_channels=3, out_channels=3)
-    except Exception:
-        # ÀÎÀÚ¾øÀÌ »ı¼º °¡´ÉÇÑ °æ¿ì
-        model = UNet()
-    model = model.to(device)
-    model.eval()
-    # Ã¼Å©Æ÷ÀÎÆ® ·Îµå
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    # state_dict Å° È®ÀÎ ÈÄ ·Îµå
-    if isinstance(checkpoint, dict):
-        if "state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["state_dict"])
-        elif "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
+
+def _collect_inputs(input_path):
+    if os.path.isdir(input_path):
+        paths = list_images(input_path)
+        if not paths:
+            raise FileNotFoundError(f"ì…ë ¥ ë””ë ‰í† ë¦¬ì— ì´ë¯¸ì§€ê°€ ì—†ìŠµë‹ˆë‹¤: {input_path}")
+        return paths
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"ì…ë ¥ ì´ë¯¸ì§€ë¥¼ ì°¾ì„ ìˆ˜ ì—†ìŠµë‹ˆë‹¤: {input_path}")
+    return [input_path]
+
+
+def _resolve_gt(gt_arg, img_path):
+    """--gt ê°€ ë””ë ‰í† ë¦¬ë©´ ê°™ì€ stem ì˜ íŒŒì¼ì„, íŒŒì¼ì´ë©´ ê·¸ íŒŒì¼ì„ ì‚¬ìš©."""
+    if not gt_arg:
+        return None
+    if os.path.isdir(gt_arg):
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        for cand in list_images(gt_arg):
+            if os.path.splitext(os.path.basename(cand))[0] == stem:
+                return cand
+        return None
+    return gt_arg if os.path.isfile(gt_arg) else None
+
+
+def run_inference(cfg, input_path, output_dir=None, gt=None,
+                  seg_weights=None, rest_weights=None, save_mask=True):
+    set_global_seed(cfg["seed"], deterministic=cfg["deterministic"])
+    device = resolve_device(cfg["device"])
+    print(f"ì‚¬ìš© ì¥ì¹˜: {device}")
+
+    image_paths = _collect_inputs(input_path)
+    output_dir = ensure_dir(output_dir or os.path.join(cfg["paths"]["output_dir"], "inference"))
+    seg_model, rest_model = load_models(cfg, device, seg_weights, rest_weights)
+
+    results = []
+    for img_path in image_paths:
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        img = Image.open(img_path).convert("RGB")
+        restored, mask_pil = restore_image(cfg, seg_model, rest_model, img, device)
+
+        restored_path = os.path.join(output_dir, f"{stem}_restored.png")
+        restored.save(restored_path)
+        if save_mask:
+            mask_pil.save(os.path.join(output_dir, f"{stem}_mask.png"))
+
+        result = {"image": stem, "restored": restored_path,
+                  "psnr": None, "ssim": None, "repairable": None}
+
+        gt_path = _resolve_gt(gt, img_path)
+        if gt_path:
+            gt_img = Image.open(gt_path).convert("RGB")
+            if gt_img.size != restored.size:
+                gt_img = gt_img.resize(restored.size, resample=Image.BILINEAR)
+            gt_arr, out_arr = np.array(gt_img), np.array(restored)
+            result["psnr"] = float(peak_signal_noise_ratio(gt_arr, out_arr, data_range=255))
+            result["ssim"] = float(structural_similarity(gt_arr, out_arr, channel_axis=-1,
+                                                         data_range=255))
+            result["repairable"] = (result["psnr"] >= PSNR_THRESHOLD
+                                    and result["ssim"] >= SSIM_THRESHOLD)
+            grade = grade_restoration(result["psnr"], result["ssim"], 0.0)
+            print(f"{stem}: PSNR {result['psnr']:.2f}dB, SSIM {result['ssim']:.4f} â†’ "
+                  f"{'ìˆ˜ë¦¬ ê°€ëŠ¥' if result['repairable'] else 'ìˆ˜ë¦¬ ë¶ˆê°€'} ({grade})")
         else:
-            model.load_state_dict(checkpoint)
-    else:
-        # Ã¼Å©Æ÷ÀÎÆ® ÀÚÃ¼°¡ state_dictÀÎ °æ¿ì
-        model.load_state_dict(checkpoint)
-    return model
+            print(f"{stem}: ë³µì› ê²°ê³¼ ì €ì¥ â†’ {restored_path} "
+                  f"(ì›ë³¸ ë¯¸ì œê³µìœ¼ë¡œ PSNR/SSIM í‰ê°€ ìƒëµ)")
+        results.append(result)
 
-def process_image(image_path, model, device):
-    """´ÜÀÏ ÀÌ¹ÌÁö¿¡ ´ëÇØ ¸ğµ¨ Ãß·ĞÀ» ¼öÇàÇÏ°í º¹¿øµÈ ÀÌ¹ÌÁö¸¦ PIL ÇüÅÂ·Î ¹İÈ¯."""
-    # ÀÌ¹ÌÁö ºÒ·¯¿À±â ¹× ÅÙ¼­·Î º¯È¯
-    img = Image.open(image_path).convert("RGB")
-    to_tensor = transforms.ToTensor()  # [0, 255] -> [0.0, 1.0] ¹üÀ§·Î º¯È¯
-    input_tensor = to_tensor(img).unsqueeze(0).to(device)  # ¹èÄ¡ Â÷¿ø Ãß°¡ ÈÄ ÀåÄ¡·Î ÀÌµ¿
-
-    # ¸ğµ¨ Ãß·Ğ (gradient °è»ê ºñÈ°¼ºÈ­)
-    with torch.no_grad():
-        output_tensor = model(input_tensor)
-    # Ãâ·Â ÅÙ¼­ ÈÄÃ³¸®: CPU·Î ÀÌµ¿ ¹× ÀÌ¹ÌÁö ¹üÀ§·Î º¯È¯
-    output_tensor = output_tensor.squeeze(0).cpu()  # [C, H, W]
-    # Ãâ·ÂÀÌ ÀÌ¹Ì [0.0,1.0] ¹üÀ§¶ó°í °¡Á¤ÇÏ°í 0~255·Î º¯È¯
-    output_np = output_tensor.numpy()
-    # °ª ¹üÀ§¸¦ [0,255]·Î Å¬·¥ÇÁÇÏ°í uint8 Çü º¯È¯
-    output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
-    # [C, H, W] -> [H, W, C]·Î Ãà º¯È¯ÇÏ¿© PIL ÀÌ¹ÌÁö »ı¼º
-    output_img = Image.fromarray(np.transpose(output_np, (1, 2, 0)))
-    return output_img
-
-def main():
-    parser = argparse.ArgumentParser(description="Â÷·® ÆÄ¼Õ ÀÌ¹ÌÁö º¹¿ø ¹× ¼ö¸® °¡´É ¿©ºÎ ÆÇ´Ü")
-    parser.add_argument("--input", type=str, required=True, help="ÀÔ·Â ÀÌ¹ÌÁö °æ·Î³ª µğ·ºÅä¸® (¼Õ»óµÈ ÀÌ¹ÌÁö)")
-    parser.add_argument("--output", type=str, help="º¹¿øµÈ ÀÌ¹ÌÁö¸¦ ÀúÀåÇÒ °æ·Î³ª µğ·ºÅä¸®")
-    parser.add_argument("--model", type=str, required=True, help="ÇĞ½ÀµÈ ¸ğµ¨ °¡ÁßÄ¡ ÆÄÀÏ °æ·Î")
-    parser.add_argument("--gt", type=str, help="¿øº» ÀÌ¹ÌÁö(Á¤»ó »óÅÂ) °æ·Î ¶Ç´Â µğ·ºÅä¸® (¼±ÅÃ »çÇ×)")
-    parser.add_argument("--gpu", action="store_true", help="GPU »ç¿ë ¿©ºÎ (ÁöÁ¤ ½Ã °¡´ÉÇÒ °æ¿ì GPU »ç¿ë)")
-    args = parser.parse_args()
-
-    # ÀåÄ¡ ¼³Á¤ (GPU »ç¿ë ¿É¼Ç¿¡ µû¶ó)
-    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
-    # ¸ğµ¨ ·Îµå
-    model = load_model(args.model, device)
-
-    # ÀÔ·Â °æ·Î°¡ µğ·ºÅä¸®ÀÎÁö ÆÄÀÏÀÎÁö È®ÀÎ
-    input_paths = []
-    if os.path.isdir(args.input):
-        # µğ·ºÅä¸® ³»ÀÇ ÀÌ¹ÌÁö ÆÄÀÏ ¸ñ·Ï ÃßÃâ (jpg, png µî È®ÀåÀÚ ÇÊÅÍ¸µ)
-        for fname in os.listdir(args.input):
-            if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
-                input_paths.append(os.path.join(args.input, fname))
-        input_paths.sort()
-    else:
-        input_paths.append(args.input)
-
-    # Ãâ·Â °æ·Î ÁØºñ
-    save_single_file = False
-    output_dir = None
-    if args.output:
-        # Ãâ·ÂÀÌ ÁöÁ¤µÈ °æ¿ì
-        if len(input_paths) > 1:
-            # ÀÔ·ÂÀÌ ¿©·¯ °³ÀÎ °æ¿ì outputÀ» µğ·ºÅä¸®·Î °£ÁÖ
-            output_dir = args.output
-            os.makedirs(output_dir, exist_ok=True)
-        else:
-            # ÇÑ °³ÀÇ ÀÔ·Â¿¡ ´ëÇØ ´ÜÀÏ ÆÄÀÏ °æ·Î·Î ÀúÀå
-            if args.output.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
-                save_single_file = True
-            else:
-                # ÆÄÀÏ¸íÀÌ ¾Æ´Ï¸é µğ·ºÅä¸®·Î °£ÁÖÇÏ¿© »ı¼º
-                output_dir = args.output
-                os.makedirs(output_dir, exist_ok=True)
-
-    # ¿øº» ÀÌ¹ÌÁö °æ·Î°¡ µğ·ºÅä¸®ÀÎÁö È®ÀÎ (º¹¼ö ÀÔ·Â ´ëÀÀ)
-    gt_dir = None
-    single_gt_path = None
-    if args.gt:
-        if os.path.isdir(args.gt):
-            gt_dir = args.gt
-        else:
-            single_gt_path = args.gt
-
-    # °¢ ÀÔ·Â ÀÌ¹ÌÁö¿¡ ´ëÇØ Ãß·Ğ ¹× °á°ú Ã³¸®
-    for img_path in input_paths:
-        # ¸ğµ¨·Î º¹¿øµÈ ÀÌ¹ÌÁö ¾ò±â
-        restored_img = process_image(img_path, model, device)
-
-        # º¹¿ø ÀÌ¹ÌÁö ÀúÀå (µğ·ºÅä¸® ¶Ç´Â ÆÄÀÏ·Î)
-        if output_dir:
-            # Ãâ·Â µğ·ºÅä¸®°¡ ÁÖ¾îÁ³À» °æ¿ì, ¿øº» ÆÄÀÏ¸í¿¡ "_restored" Á¢¹Ì»ç¸¦ ºÙ¿© ÀúÀå
-            base_name, ext = os.path.splitext(os.path.basename(img_path))
-            save_path = os.path.join(output_dir, f"{base_name}_restored{ext if ext else '.png'}")
-            restored_img.save(save_path)
-        elif save_single_file:
-            # Ãâ·ÂÀÌ ´ÜÀÏ ÆÄÀÏ·Î ÁöÁ¤µÈ °æ¿ì
-            restored_img.save(args.output)
-        else:
-            # Ãâ·Â °æ·Î ¹ÌÁöÁ¤ ½Ã, ÀÔ·Â ÆÄÀÏ¸í¿¡ "_restored"¸¦ ºÙ¿© µ¿ÀÏ À§Ä¡¿¡ ÀúÀå
-            base_name, ext = os.path.splitext(img_path)
-            save_path = f"{base_name}_restored{ext if ext else '.png'}"
-            restored_img.save(save_path)
-
-        # ¿øº» ÀÌ¹ÌÁö(Á¤»ó ÀÌ¹ÌÁö)°¡ Á¦°øµÈ °æ¿ì PSNR ¹× SSIM °è»ê
-        if args.gt:
-            original_img = None
-            if gt_dir:
-                # GT µğ·ºÅä¸®°¡ ÀÖ´Â °æ¿ì ÀÔ·Â ÆÄÀÏ¸í¿¡ ÇØ´çÇÏ´Â GT ÀÌ¹ÌÁö »ç¿ë
-                gt_path = os.path.join(gt_dir, os.path.basename(img_path))
-                if os.path.exists(gt_path):
-                    original_img = Image.open(gt_path).convert("RGB")
-                else:
-                    # ¸¸¾à Á¤È®ÇÑ ÀÌ¸§À¸·Î GT°¡ ¾øÀ¸¸é, È®ÀåÀÚ Á¦¿Ü ºñ±³ µî ½Ãµµ
-                    base_name = os.path.splitext(os.path.basename(img_path))[0]
-                    # µğ·ºÅä¸® ³»¿¡¼­ µ¿ÀÏÇÑ ÀÌ¸§À» °¡Áø ÆÄÀÏ °Ë»ö
-                    candidates = [f for f in os.listdir(gt_dir) if f.startswith(base_name)]
-                    if candidates:
-                        original_img = Image.open(os.path.join(gt_dir, candidates[0])).convert("RGB")
-            else:
-                # ´ÜÀÏ GT °æ·Î°¡ ÁÖ¾îÁø °æ¿ì (ÀÔ·ÂÀÌ ÇÏ³ªÀÏ ¶§¸¸ À¯ÀÇ¹Ì)
-                original_img = Image.open(single_gt_path).convert("RGB")
-
-            if original_img is not None:
-                # numpy ¹è¿­·Î º¯È¯
-                orig_np = np.array(original_img)
-                restored_np = np.array(restored_img)
-                # PSNR, SSIM °è»ê (ÄÃ·¯ ÀÌ¹ÌÁöÀÌ¹Ç·Î multichannel=True)
-                psnr_val = peak_signal_noise_ratio(orig_np, restored_np, data_range=255)
-                ssim_val = structural_similarity(orig_np, restored_np, multichannel=True, data_range=255)
-                # ±âÁØ¿¡ µû¶ó °á°ú Ãâ·Â
-                result_text = "¼ö¸® °¡´É" if (psnr_val >= PSNR_THRESHOLD and ssim_val >= SSIM_THRESHOLD) else "¼ö¸® ºÒ°¡"
-                if len(input_paths) > 1:
-                    print(f"{os.path.basename(img_path)}: {result_text}")
-                else:
-                    print(result_text)
-            else:
-                # ¿øº» ÀÌ¹ÌÁö°¡ Á¸ÀçÇÏÁö ¾Ê¾Æ Æò°¡ÇÏÁö ¸øÇÑ °æ¿ì
-                if len(input_paths) > 1:
-                    print(f"{os.path.basename(img_path)}: ¿øº» ÀÌ¹ÌÁö ¾øÀ½ (Æò°¡ »ı·«)")
-                else:
-                    print("¿øº» ÀÌ¹ÌÁö°¡ Á¦°øµÇÁö ¾Ê¾Æ PSNR/SSIM Æò°¡¸¦ »ı·«ÇÕ´Ï´Ù.")
-
-if __name__ == "__main__":
-    main()
+    return results
