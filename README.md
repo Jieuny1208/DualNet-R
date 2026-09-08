@@ -22,7 +22,7 @@ Surface-damage restoration in industrial settings faces a fundamental supervisio
 The result is a deployment-oriented system: the diffusion model is removed from the inference path entirely (**859.5M → 31.4M parameters**), and restoration quality is judged not by pixel fidelity alone but by human perception — where DualNet-R is decisively preferred.
 
 <div align="center">
-<img src="assets/fig1.png" width="92%" alt="DualNet-R four-phase pipeline"/>
+<img src="assets/fig1.png" width="68%" alt="DualNet-R four-phase pipeline"/>
 <br><em>The four-phase DualNet-R pipeline: weakly-supervised segmentation &rarr; self-training refinement &rarr; teacher pseudo-GT generation &rarr; student distillation.</em>
 </div>
 
@@ -44,7 +44,7 @@ Four sequential phases; each stage consumes the previous stage's output:
 | 4 | Student distillation | 4-ch input (RGB + mask), tanh head, mask-weighted L1 (2× inside mask); Adam, lr 1e-4, batch 8, StepLR ×0.5 / 40 epochs |
 
 <div align="center">
-<img src="assets/fig1-5.png" width="72%" alt="Irreparability decision logic"/>
+<img src="assets/fig1-5.png" width="52%" alt="Irreparability decision logic"/>
 <br><em>Irreparability decision logic: repairable vs. irreparable configurations under the five auditable criteria.</em>
 </div>
 
@@ -53,7 +53,7 @@ Four sequential phases; each stage consumes the previous stage's output:
 ## Results
 
 <div align="center">
-<img src="assets/fig4.png" width="92%" alt="Qualitative restoration comparison"/>
+<img src="assets/fig4.png" width="68%" alt="Qualitative restoration comparison"/>
 <br><em>Qualitative comparison on CarDD test images.</em>
 </div>
 
@@ -129,7 +129,7 @@ python <inference_script>.py --input path/to/image.jpg
 @article{dualnetr2026,
   title   = {DualNet-R: Dual-Network Surface Restoration with Diffusion-Based
              Pseudo-Ground Truth Generation},
-  author  = {Lee, Jieun and Kim, Doohong and Jeong, Jongpil},
+  author  = {Lee, Jieun and Kim, Tae-yong and Kim, Doohong and Jeong, Jongpil},
   journal = {Scientific Reports (under revision)},
   year    = {2026}
 }
