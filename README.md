@@ -53,7 +53,7 @@ Four sequential phases; each stage consumes the previous stage's output:
 ## Results
 
 <div align="center">
-<img src="assets/qualitative.png" width="92%" alt="Qualitative restoration comparison"/>
+<img src="assets/fig4.png" width="92%" alt="Qualitative restoration comparison"/>
 <br><em>Qualitative comparison on CarDD test images.</em>
 </div>
 
